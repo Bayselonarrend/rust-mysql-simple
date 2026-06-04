@@ -71,6 +71,24 @@ use crate::{
 use crate::DriverError::TlsNotSupported;
 use crate::SslOpts;
 
+/// Deprecated MySQL plugin; uses the same SHA-256 scramble as `caching_sha2_password`.
+const SHA256_PASSWORD_PLUGIN_NAME: &[u8] = b"sha256_password";
+
+fn is_sha256_password_plugin(plugin: &AuthPlugin<'_>) -> bool {
+    matches!(
+        plugin,
+        AuthPlugin::Other(name) if name.as_ref() == SHA256_PASSWORD_PLUGIN_NAME
+    )
+}
+
+fn normalize_auth_plugin(plugin: AuthPlugin<'static>) -> AuthPlugin<'static> {
+    if is_sha256_password_plugin(&plugin) {
+        AuthPlugin::CachingSha2Password
+    } else {
+        plugin
+    }
+}
+
 #[cfg(feature = "binlog")]
 use self::binlog_stream::BinlogStream;
 
@@ -670,7 +688,8 @@ impl Conn {
         }
 
         self.0.nonce = auth_switch_request.plugin_data().to_vec();
-        self.0.auth_plugin = auth_switch_request.auth_plugin().into_owned();
+        self.0.auth_plugin =
+            normalize_auth_plugin(auth_switch_request.auth_plugin().into_owned());
         let plugin_data = match self.0.auth_plugin {
             ref x @ AuthPlugin::MysqlOldPassword => {
                 if self.0.opts.get_secure_auth() {
@@ -748,11 +767,9 @@ impl Conn {
             nonce
         };
 
-        // Allow only CachingSha2Password and MysqlNativePassword here
-        // because sha256_password is deprecated and other plugins won't
-        // appear here.
         self.0.auth_plugin = match handshake.auth_plugin() {
             Some(x @ AuthPlugin::CachingSha2Password) => x.into_owned(),
+            Some(x) if is_sha256_password_plugin(&x) => AuthPlugin::CachingSha2Password,
             _ => AuthPlugin::MysqlNativePassword,
         };
 
@@ -904,6 +921,11 @@ impl Conn {
             }
             AuthPlugin::MariadbParsec { .. } => {
                 self.continue_parsec_auth(auth_switched)?;
+                Ok(())
+            }
+            AuthPlugin::Other(ref name) if name.as_ref() == SHA256_PASSWORD_PLUGIN_NAME => {
+                self.0.auth_plugin = AuthPlugin::CachingSha2Password;
+                self.continue_caching_sha2_password_auth(auth_switched)?;
                 Ok(())
             }
             AuthPlugin::Other(ref name) => {
